@@ -25,11 +25,10 @@ if (!ADMIN_API_KEY || ADMIN_API_KEY.length < 32) {
 }
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : undefined,
+  connectionString: process.env.DATABASE_URL,
+  max: 5,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
 });
 
 // ----------------------------------------------------
