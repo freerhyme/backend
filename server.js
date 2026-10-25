@@ -25,15 +25,15 @@ if (!ADMIN_API_KEY || ADMIN_API_KEY.length < 32) {
 }
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   max: 5,
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
 });
 
-// ----------------------------------------------------
+// ====================================================
 // DATABASE INITIALIZATION
-// ----------------------------------------------------
+// ====================================================
 
 async function initializeDatabase() {
   await pool.query(`
@@ -68,12 +68,21 @@ async function initializeDatabase() {
     )
   `);
 
+  // Additive migration: preserves existing devices.
+  await pool.query(`
+    ALTER TABLE devices
+      ADD COLUMN IF NOT EXISTS public_key TEXT,
+      ADD COLUMN IF NOT EXISTS public_key_fingerprint TEXT,
+      ADD COLUMN IF NOT EXISTS pending_public_key TEXT,
+      ADD COLUMN IF NOT EXISTS pending_key_fingerprint TEXT
+  `);
+
   console.log("Database initialized");
 }
 
-// ----------------------------------------------------
+// ====================================================
 // HELPERS
-// ----------------------------------------------------
+// ====================================================
 
 function hashToken(token) {
   return crypto
@@ -90,13 +99,79 @@ function safeEqual(a, b) {
   const left = Buffer.from(a);
   const right = Buffer.from(b);
 
-  if (left.length !== right.length) return false;
+  if (left.length !== right.length) {
+    return false;
+  }
 
   return crypto.timingSafeEqual(left, right);
 }
 
 function generateDeviceToken() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+function fingerprintPublicKey(der) {
+  return crypto
+    .createHash("sha256")
+    .update(der)
+    .digest("hex");
+}
+
+function parseP256PublicKey(encoded) {
+  if (
+    typeof encoded !== "string" ||
+    encoded.length > 256 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+  ) {
+    throw new Error("Invalid public key encoding");
+  }
+
+  const der = Buffer.from(encoded, "base64");
+
+  if (
+    der.length < 70 ||
+    der.length > 150 ||
+    der.toString("base64") !== encoded
+  ) {
+    throw new Error("Invalid public key encoding");
+  }
+
+  const key = crypto.createPublicKey({
+    key: der,
+    format: "der",
+    type: "spki",
+  });
+
+  if (
+    key.asymmetricKeyType !== "ec" ||
+    key.asymmetricKeyDetails?.namedCurve !== "prime256v1"
+  ) {
+    throw new Error("Expected P-256 public key");
+  }
+
+  return { key, der };
+}
+
+function parseSignature(encoded) {
+  if (
+    typeof encoded !== "string" ||
+    encoded.length > 256 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+  ) {
+    throw new Error("Invalid signature encoding");
+  }
+
+  const signature = Buffer.from(encoded, "base64");
+
+  if (
+    signature.length < 64 ||
+    signature.length > 80 ||
+    signature.toString("base64") !== encoded
+  ) {
+    throw new Error("Invalid signature encoding");
+  }
+
+  return signature;
 }
 
 function publicDevice(device) {
@@ -106,6 +181,10 @@ function publicDevice(device) {
     model: device.model,
     serialLast4: device.serial_last4,
     status: device.status,
+    keyFingerprint:
+      device.public_key_fingerprint || null,
+    pendingKeyFingerprint:
+      device.pending_key_fingerprint || null,
     createdAt: device.created_at,
   };
 }
@@ -125,9 +204,30 @@ function formatTransaction(row) {
   };
 }
 
-// ----------------------------------------------------
+async function findDeviceByToken(token) {
+  if (
+    typeof token !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(token)
+  ) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM devices
+    WHERE device_token_hash = $1
+    LIMIT 1
+    `,
+    [hashToken(token)]
+  );
+
+  return result.rows[0] || null;
+}
+
+// ====================================================
 // ADMIN AUTHENTICATION
-// ----------------------------------------------------
+// ====================================================
 
 function requireAdmin(req, res, next) {
   const key = req.get("x-admin-key");
@@ -142,9 +242,9 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ----------------------------------------------------
+// ====================================================
 // DEVICE AUTHENTICATION
-// ----------------------------------------------------
+// ====================================================
 
 async function requireActiveDevice(req, res, next) {
   try {
@@ -157,19 +257,7 @@ async function requireActiveDevice(req, res, next) {
       });
     }
 
-    const tokenHash = hashToken(token);
-
-    const result = await pool.query(
-      `
-      SELECT *
-      FROM devices
-      WHERE device_token_hash = $1
-      LIMIT 1
-      `,
-      [tokenHash]
-    );
-
-    const device = result.rows[0];
+    const device = await findDeviceByToken(token);
 
     if (!device) {
       return res.status(401).json({
@@ -193,9 +281,9 @@ async function requireActiveDevice(req, res, next) {
   }
 }
 
-// ----------------------------------------------------
+// ====================================================
 // HEALTH CHECK
-// ----------------------------------------------------
+// ====================================================
 
 app.get("/healthz", async (req, res, next) => {
   try {
@@ -213,9 +301,9 @@ app.get("/healthz", async (req, res, next) => {
   }
 });
 
-// ----------------------------------------------------
+// ====================================================
 // REGISTER DEVICE
-// ----------------------------------------------------
+// ====================================================
 
 app.post("/devices/register", async (req, res, next) => {
   try {
@@ -298,9 +386,9 @@ app.post("/devices/register", async (req, res, next) => {
   }
 });
 
-// ----------------------------------------------------
+// ====================================================
 // DEVICE STATUS
-// ----------------------------------------------------
+// ====================================================
 
 app.get("/devices/status", async (req, res, next) => {
   try {
@@ -313,17 +401,7 @@ app.get("/devices/status", async (req, res, next) => {
       });
     }
 
-    const result = await pool.query(
-      `
-      SELECT *
-      FROM devices
-      WHERE device_token_hash = $1
-      LIMIT 1
-      `,
-      [hashToken(token)]
-    );
-
-    const device = result.rows[0];
+    const device = await findDeviceByToken(token);
 
     if (!device) {
       return res.status(404).json({
@@ -341,9 +419,116 @@ app.get("/devices/status", async (req, res, next) => {
   }
 });
 
-// ----------------------------------------------------
+// ====================================================
+// ANDROID KEYSTORE: PUBLIC KEY ENROLLMENT
+// ====================================================
+
+// This is Stage 1 enrollment.
+// Device-token authentication is still in use.
+// Key approval requires a separate administrator action.
+
+app.post(
+  "/devices/key-enrollment",
+  requireActiveDevice,
+  async (req, res, next) => {
+    try {
+      const device = req.device;
+
+      if (device.public_key) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "A public key is already approved. " +
+            "Administrator-controlled key rotation is required.",
+        });
+      }
+
+      const { publicKey, signature } = req.body || {};
+
+      let parsedKey;
+      let parsedSignature;
+
+      try {
+        parsedKey = parseP256PublicKey(publicKey);
+        parsedSignature = parseSignature(signature);
+      } catch (error) {
+        return res.status(400).json({
+          ok: false,
+          error: error.message,
+        });
+      }
+
+      // Canonical message signed by Android Keystore.
+      // The mobile app must construct exactly this string.
+      const message =
+        `SWIFT_POS_KEY_ENROLL_V1\n` +
+        `${device.id}\n` +
+        `${publicKey}`;
+
+      const verified = crypto.verify(
+        "sha256",
+        Buffer.from(message, "utf8"),
+        parsedKey.key,
+        parsedSignature
+      );
+
+      if (!verified) {
+        return res.status(403).json({
+          ok: false,
+          error: "Signature verification failed",
+        });
+      }
+
+      const fingerprint = fingerprintPublicKey(
+        parsedKey.der
+      );
+
+      // Do not allow a different pending key to silently
+      // replace an existing enrollment request.
+      const result = await pool.query(
+        `
+        UPDATE devices
+        SET
+          pending_public_key = $1,
+          pending_key_fingerprint = $2,
+          updated_at = NOW()
+        WHERE id = $3
+          AND status = 'ACTIVE'
+          AND public_key IS NULL
+          AND (
+            pending_public_key IS NULL
+            OR pending_key_fingerprint = $2
+          )
+        RETURNING *
+        `,
+        [publicKey, fingerprint, device.id]
+      );
+
+      if (!result.rows.length) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "A different key enrollment is already pending. " +
+            "Contact the administrator.",
+        });
+      }
+
+      res.json({
+        ok: true,
+        status: "PENDING_KEY_APPROVAL",
+        fingerprint,
+        message:
+          "Public key submitted for administrator approval",
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ====================================================
 // ADMIN: LIST DEVICES
-// ----------------------------------------------------
+// ====================================================
 
 app.get(
   "/admin/devices",
@@ -357,6 +542,8 @@ app.get(
           model,
           serial_last4,
           status,
+          public_key_fingerprint,
+          pending_key_fingerprint,
           created_at,
           updated_at
         FROM devices
@@ -373,9 +560,9 @@ app.get(
   }
 );
 
-// ----------------------------------------------------
+// ====================================================
 // ADMIN: APPROVE DEVICE
-// ----------------------------------------------------
+// ====================================================
 
 app.post(
   "/admin/devices/:id/approve",
@@ -412,9 +599,69 @@ app.post(
   }
 );
 
-// ----------------------------------------------------
+// ====================================================
+// ADMIN: APPROVE DEVICE PUBLIC KEY
+// ====================================================
+
+app.post(
+  "/admin/devices/:id/approve-key",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const { fingerprint } = req.body || {};
+
+      if (
+        typeof fingerprint !== "string" ||
+        !/^[a-f0-9]{64}$/.test(fingerprint)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Full lowercase SHA-256 fingerprint required",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE devices
+        SET
+          public_key = pending_public_key,
+          public_key_fingerprint = pending_key_fingerprint,
+          pending_public_key = NULL,
+          pending_key_fingerprint = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+          AND status = 'ACTIVE'
+          AND public_key IS NULL
+          AND pending_public_key IS NOT NULL
+          AND pending_key_fingerprint = $2
+        RETURNING *
+        `,
+        [req.params.id, fingerprint]
+      );
+
+      if (!result.rows.length) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "No matching pending key found for approval",
+        });
+      }
+
+      res.json({
+        ok: true,
+        message: "Device public key approved",
+        device: publicDevice(result.rows[0]),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ====================================================
 // ADMIN: BLOCK DEVICE
-// ----------------------------------------------------
+// ====================================================
 
 app.post(
   "/admin/devices/:id/block",
@@ -450,9 +697,9 @@ app.post(
   }
 );
 
-// ----------------------------------------------------
+// ====================================================
 // PROCESS SIMULATED PAYMENT
-// ----------------------------------------------------
+// ====================================================
 
 app.post(
   "/process-payment",
@@ -497,7 +744,6 @@ app.post(
 
       const normalizedAmount = value.toFixed(2);
       const approved = testCardId === "visa";
-
       const transactionId = crypto.randomUUID();
 
       const result = await pool.query(
@@ -515,7 +761,8 @@ app.post(
           response_code
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+          $1, $2, $3, $4, $5,
+          $6, $7, $8, $9, $10
         )
         ON CONFLICT (device_id, request_id)
         DO NOTHING
@@ -551,7 +798,9 @@ app.post(
         transaction = existing.rows[0];
 
         if (!transaction) {
-          throw new Error("Could not retrieve existing transaction");
+          throw new Error(
+            "Could not retrieve existing transaction"
+          );
         }
 
         if (
@@ -564,7 +813,8 @@ app.post(
         ) {
           return res.status(409).json({
             ok: false,
-            error: "Request ID reused with different payment details",
+            error:
+              "Request ID reused with different payment details",
           });
         }
       }
@@ -581,9 +831,9 @@ app.post(
   }
 );
 
-// ----------------------------------------------------
+// ====================================================
 // DEVICE TRANSACTION HISTORY
-// ----------------------------------------------------
+// ====================================================
 
 app.get(
   "/transactions",
@@ -611,14 +861,17 @@ app.get(
   }
 );
 
-// ----------------------------------------------------
+// ====================================================
 // ERROR HANDLING
-// ----------------------------------------------------
+// ====================================================
 
 app.use((error, req, res, next) => {
   console.error("API error:", error.message);
 
-  if (error instanceof SyntaxError && error.status === 400) {
+  if (
+    error instanceof SyntaxError &&
+    error.status === 400
+  ) {
     return res.status(400).json({
       ok: false,
       error: "Invalid JSON",
@@ -638,15 +891,17 @@ app.use((error, req, res, next) => {
   });
 });
 
-// ----------------------------------------------------
+// ====================================================
 // START SERVER
-// ----------------------------------------------------
+// ====================================================
 
 async function start() {
   await initializeDatabase();
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`SWIFT POS Simulator API running on ${PORT}`);
+    console.log(
+      `SWIFT POS Simulator API running on ${PORT}`
+    );
   });
 }
 
