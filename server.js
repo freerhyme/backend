@@ -1100,6 +1100,99 @@ app.post(
   }
 );
 
+
+ // ====================================================
+ // ADMIN: REACTIVATE BLOCKED DEVICE
+ // ====================================================
+
+app.post(
+  "/admin/devices/:id/reactivate",
+  requireAdmin,
+  async (req, res, next) => {
+    const deviceId = req.params.id;
+
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        deviceId
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid device ID",
+      });
+    }
+
+    let client;
+
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `
+        UPDATE devices
+        SET status = 'ACTIVE',
+            updated_at = NOW()
+        WHERE id = $1
+          AND status = 'BLOCKED'
+          AND public_key IS NOT NULL
+          AND public_key_fingerprint IS NOT NULL
+        RETURNING *
+        `,
+        [deviceId]
+      );
+
+      if (!result.rows.length) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          error:
+            "Device is not blocked or has no approved public key",
+        });
+      }
+
+      // Remove any old sessions and challenges.
+      // The reactivated device must sign a fresh
+      // challenge before accessing protected APIs.
+      await client.query(
+        `
+        DELETE FROM device_auth_sessions
+        WHERE device_id = $1
+        `,
+        [deviceId]
+      );
+
+      await client.query(
+        `
+        DELETE FROM device_auth_challenges
+        WHERE device_id = $1
+        `,
+        [deviceId]
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+        message: "Device reactivated successfully",
+        device: publicDevice(result.rows[0]),
+        requiresFreshAuthentication: true,
+      });
+    } catch (error) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+      }
+
+      next(error);
+    } finally {
+      client?.release();
+    }
+  }
+);
+
 // ====================================================
 // PROCESS SIMULATED PAYMENT
 // ====================================================
