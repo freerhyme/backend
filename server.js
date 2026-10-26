@@ -130,6 +130,21 @@ async function initializeDatabase() {
     ON CONFLICT (id) DO NOTHING
   `);
 
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS merchant_accounts (
+    device_id UUID PRIMARY KEY REFERENCES devices(id),
+    account_name TEXT NOT NULL,
+    account_number_masked TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    bank_name TEXT NOT NULL,
+    bank_code TEXT,
+    swift_code TEXT,
+    bank_address TEXT,
+    po_box TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`);
+
   console.log("Database initialized");
 }
 
@@ -1422,6 +1437,48 @@ app.get(
         transactions: result.rows.map(
           formatTransaction
         ),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ====================================================
+// MERCHANT ACCOUNT — DEVICE ACCESS
+// ====================================================
+
+app.get(
+  "/merchant-account",
+  requireActiveDevice,
+  async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `SELECT
+           account_name AS "accountName",
+           account_number_masked AS "accountNumber",
+           currency,
+           bank_name AS "bankName",
+           bank_code AS "bankCode",
+           swift_code AS "swiftCode",
+           bank_address AS "bankAddress",
+           po_box AS "poBox"
+         FROM merchant_accounts
+         WHERE device_id = $1`,
+        [req.device.id]
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          code: "MERCHANT_ACCOUNT_NOT_CONFIGURED",
+          error: "Merchant account not configured",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        account: result.rows[0],
       });
     } catch (error) {
       next(error);
