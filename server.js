@@ -1562,7 +1562,16 @@ app.put('/admin/devices/:id/merchant-account', requireAdmin, async (req, res, ne
 // ====================================================
 
 app.use((error, req, res, next) => {
-  console.error("API error:", error.message);
+  console.error("[API ERROR]", {
+    method: req.method,
+    path: req.originalUrl,
+    message: error.message,
+    code: error.code,
+    detail: error.detail,
+    constraint: error.constraint,
+    table: error.table,
+    column: error.column,
+  });
 
   if (
     error instanceof SyntaxError &&
@@ -1581,12 +1590,11 @@ app.use((error, req, res, next) => {
     });
   }
 
-  res.status(500).json({
+  return res.status(500).json({
     ok: false,
     error: "Internal server error",
   });
 });
-
 // ====================================================
 // START SERVER
 // ====================================================
