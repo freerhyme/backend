@@ -38,7 +38,13 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
 });
-
+function sendError(res, status, message, code = undefined) {
+  return res.status(status).json({
+    ok: false,
+    error: message,
+    ...(code ? { code } : {}),
+  });
+}
 // ====================================================
 // DATABASE INITIALIZATION
 // ====================================================
