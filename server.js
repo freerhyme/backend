@@ -151,8 +151,7 @@ async function initializeDatabase() {
   `);
 
   console.log("Database initialized");
-}
-const diagnostic = await pool.query(`
+  const diagnostic = await pool.query(`
   SELECT
     to_regclass('public.devices') AS devices_table,
     to_regclass('public.merchant_accounts') AS merchant_table
@@ -162,6 +161,8 @@ console.log(
   "[DATABASE DIAGNOSTIC]",
   diagnostic.rows[0]
 );
+}
+
 
 // ====================================================
 // CRYPTOGRAPHIC HELPERS
