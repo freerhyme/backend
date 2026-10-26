@@ -7,7 +7,6 @@ const crypto = require("node:crypto");
 const { Pool } = require("pg");
 
 const app = express();
-
 app.disable("x-powered-by");
 app.use(cors());
 app.use(express.json({ limit: "20kb" }));
@@ -15,7 +14,6 @@ app.use(express.json({ limit: "20kb" }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-
 const ENFORCE_KEY_AUTH =
   process.env.ENFORCE_KEY_AUTH === "true";
 
@@ -40,7 +38,7 @@ const pool = new Pool({
 });
 
 // ====================================================
-// DATABASE INITIALIZATION
+// DATABASE
 // ====================================================
 
 async function initializeDatabase() {
@@ -52,11 +50,19 @@ async function initializeDatabase() {
       model TEXT,
       serial_last4 TEXT,
       status TEXT NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING', 'ACTIVE', 'BLOCKED')),
+        CHECK (status IN ('PENDING','ACTIVE','BLOCKED')),
       device_token_hash TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE devices
+      ADD COLUMN IF NOT EXISTS public_key TEXT,
+      ADD COLUMN IF NOT EXISTS public_key_fingerprint TEXT,
+      ADD COLUMN IF NOT EXISTS pending_public_key TEXT,
+      ADD COLUMN IF NOT EXISTS pending_key_fingerprint TEXT
   `);
 
   await pool.query(`
@@ -72,20 +78,10 @@ async function initializeDatabase() {
       status TEXT NOT NULL,
       response_code TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (device_id, request_id)
+      UNIQUE(device_id, request_id)
     )
   `);
 
-  // Preserve existing device records and approved keys.
-  await pool.query(`
-    ALTER TABLE devices
-      ADD COLUMN IF NOT EXISTS public_key TEXT,
-      ADD COLUMN IF NOT EXISTS public_key_fingerprint TEXT,
-      ADD COLUMN IF NOT EXISTS pending_public_key TEXT,
-      ADD COLUMN IF NOT EXISTS pending_key_fingerprint TEXT
-  `);
-
-  // One-time authentication challenges.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS device_auth_challenges (
       id UUID PRIMARY KEY,
@@ -97,7 +93,6 @@ async function initializeDatabase() {
     )
   `);
 
-  // Short-lived authenticated sessions.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS device_auth_sessions (
       token_hash TEXT PRIMARY KEY,
@@ -119,11 +114,27 @@ async function initializeDatabase() {
     ON device_auth_sessions(device_id)
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS simulation_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      mode TEXT NOT NULL DEFAULT 'APPROVE_ALL'
+        CHECK (mode IN ('APPROVE_ALL','DECLINE_ALL')),
+      decline_next BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO simulation_settings(id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING
+  `);
+
   console.log("Database initialized");
 }
 
 // ====================================================
-// CRYPTOGRAPHIC HELPERS
+// CRYPTO HELPERS
 // ====================================================
 
 function hashToken(value) {
@@ -162,17 +173,10 @@ function generateDeviceToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
-function fingerprintPublicKey(der) {
-  return crypto
-    .createHash("sha256")
-    .update(der)
-    .digest("hex");
-}
-
 function decodeBase64(value, maxLength = 256) {
   if (
     typeof value !== "string" ||
-    value.length === 0 ||
+    !value ||
     value.length > maxLength ||
     !/^[A-Za-z0-9+/]+={0,2}$/.test(value)
   ) {
@@ -260,21 +264,24 @@ function formatTransaction(row) {
 }
 
 async function findDeviceByToken(token) {
-  if (!validToken(token)) {
-    return null;
-  }
+  if (!validToken(token)) return null;
 
   const result = await pool.query(
-    `
-    SELECT *
-    FROM devices
-    WHERE device_token_hash = $1
-    LIMIT 1
-    `,
+    `SELECT * FROM devices
+     WHERE device_token_hash = $1
+     LIMIT 1`,
     [hashToken(token)]
   );
 
   return result.rows[0] || null;
+}
+
+function sendError(res, status, error, code) {
+  return res.status(status).json({
+    ok: false,
+    error,
+    ...(code ? { code } : {}),
+  });
 }
 
 // ====================================================
@@ -285,10 +292,11 @@ function requireAdmin(req, res, next) {
   const key = req.get("x-admin-key");
 
   if (!safeEqual(key, ADMIN_API_KEY)) {
-    return res.status(401).json({
-      ok: false,
-      error: "Unauthorized administrator",
-    });
+    return sendError(
+      res,
+      401,
+      "Unauthorized administrator"
+    );
   }
 
   next();
@@ -303,60 +311,54 @@ async function requireActiveDevice(req, res, next) {
     const sessionToken =
       req.get("x-device-session");
 
-    // Prefer cryptographically authenticated sessions.
     if (sessionToken) {
       if (!validToken(sessionToken)) {
-        return res.status(401).json({
-          ok: false,
-          error: "Invalid device session",
-        });
+        return sendError(
+          res,
+          401,
+          "Invalid device session"
+        );
       }
 
       const result = await pool.query(
-        `
-        SELECT d.*
-        FROM device_auth_sessions s
-        JOIN devices d
-          ON d.id = s.device_id
-        WHERE s.token_hash = $1
-          AND s.expires_at > NOW()
-          AND d.status = 'ACTIVE'
-          AND d.public_key IS NOT NULL
-        LIMIT 1
-        `,
+        `SELECT d.*
+         FROM device_auth_sessions s
+         JOIN devices d ON d.id = s.device_id
+         WHERE s.token_hash = $1
+           AND s.expires_at > NOW()
+           AND d.status = 'ACTIVE'
+           AND d.public_key IS NOT NULL
+         LIMIT 1`,
         [hashToken(sessionToken)]
       );
 
       if (!result.rows.length) {
-        return res.status(401).json({
-          ok: false,
-          error: "Device session expired or revoked",
-          code: "SESSION_EXPIRED",
-        });
+        return sendError(
+          res,
+          401,
+          "Device session expired or revoked",
+          "SESSION_EXPIRED"
+        );
       }
 
       req.device = result.rows[0];
       return next();
     }
 
-    // Legacy authentication remains available
-    // during the migration.
     const token = req.get("x-device-token");
 
     if (!validToken(token)) {
-      return res.status(401).json({
-        ok: false,
-        error: "Device authentication required",
-      });
+      return sendError(
+        res,
+        401,
+        "Device authentication required"
+      );
     }
 
     const device = await findDeviceByToken(token);
 
     if (!device) {
-      return res.status(401).json({
-        ok: false,
-        error: "Unknown device",
-      });
+      return sendError(res, 401, "Unknown device");
     }
 
     if (device.status !== "ACTIVE") {
@@ -367,15 +369,13 @@ async function requireActiveDevice(req, res, next) {
       });
     }
 
-    // Once enforcement is enabled, enrolled devices
-    // must authenticate using their approved key.
     if (ENFORCE_KEY_AUTH && device.public_key) {
-      return res.status(401).json({
-        ok: false,
-        code: "KEY_AUTH_REQUIRED",
-        error:
-          "Cryptographic device session required",
-      });
+      return sendError(
+        res,
+        401,
+        "Cryptographic device session required",
+        "KEY_AUTH_REQUIRED"
+      );
     }
 
     req.device = device;
@@ -424,50 +424,40 @@ app.post("/devices/register", async (req, res, next) => {
         installationId
       )
     ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid installation ID",
-      });
+      return sendError(
+        res,
+        400,
+        "Invalid installation ID"
+      );
     }
 
     const existing = await pool.query(
-      `
-      SELECT id
-      FROM devices
-      WHERE installation_id = $1
-      `,
+      `SELECT id FROM devices
+       WHERE installation_id = $1`,
       [installationId]
     );
 
-    if (existing.rows.length > 0) {
-      return res.status(409).json({
-        ok: false,
-        error: "Device already registered",
-        code: "DEVICE_ALREADY_REGISTERED",
-      });
+    if (existing.rows.length) {
+      return sendError(
+        res,
+        409,
+        "Device already registered",
+        "DEVICE_ALREADY_REGISTERED"
+      );
     }
 
     const token = generateDeviceToken();
-    const id = crypto.randomUUID();
 
     const result = await pool.query(
-      `
-      INSERT INTO devices (
-        id,
-        installation_id,
-        manufacturer,
-        model,
-        serial_last4,
-        status,
-        device_token_hash
-      )
-      VALUES (
-        $1, $2, $3, $4, $5, 'PENDING', $6
-      )
-      RETURNING *
-      `,
+      `INSERT INTO devices (
+         id, installation_id, manufacturer,
+         model, serial_last4, status,
+         device_token_hash
+       )
+       VALUES ($1,$2,$3,$4,$5,'PENDING',$6)
+       RETURNING *`,
       [
-        id,
+        crypto.randomUUID(),
         installationId,
         String(manufacturer || "").slice(0, 100),
         String(model || "").slice(0, 100),
@@ -484,12 +474,12 @@ app.post("/devices/register", async (req, res, next) => {
     });
   } catch (error) {
     if (error.code === "23505") {
-      return res.status(409).json({
-        ok: false,
-        error: "Device already registered",
-      });
+      return sendError(
+        res,
+        409,
+        "Device already registered"
+      );
     }
-
     next(error);
   }
 });
@@ -503,19 +493,21 @@ app.get("/devices/status", async (req, res, next) => {
     const token = req.get("x-device-token");
 
     if (!validToken(token)) {
-      return res.status(401).json({
-        ok: false,
-        error: "Device token required",
-      });
+      return sendError(
+        res,
+        401,
+        "Device token required"
+      );
     }
 
     const device = await findDeviceByToken(token);
 
     if (!device) {
-      return res.status(404).json({
-        ok: false,
-        error: "Device not registered",
-      });
+      return sendError(
+        res,
+        404,
+        "Device not registered"
+      );
     }
 
     res.json({
@@ -538,35 +530,37 @@ app.post(
       const token = req.get("x-device-token");
 
       if (!validToken(token)) {
-        return res.status(401).json({
-          ok: false,
-          error: "Device token required",
-        });
+        return sendError(
+          res,
+          401,
+          "Device token required"
+        );
       }
 
       const device = await findDeviceByToken(token);
 
       if (!device) {
-        return res.status(401).json({
-          ok: false,
-          error: "Unknown device",
-        });
+        return sendError(
+          res,
+          401,
+          "Unknown device"
+        );
       }
 
       if (device.status !== "ACTIVE") {
-        return res.status(403).json({
-          ok: false,
-          error: "Device not active",
-        });
+        return sendError(
+          res,
+          403,
+          "Device not active"
+        );
       }
 
       if (device.public_key) {
-        return res.status(409).json({
-          ok: false,
-          error:
-            "A public key is already approved. " +
-            "Administrator-controlled rotation required.",
-        });
+        return sendError(
+          res,
+          409,
+          "A public key is already approved. Administrator-controlled rotation required."
+        );
       }
 
       const { publicKey, signature } =
@@ -579,10 +573,11 @@ app.post(
         parsedKey = parseP256PublicKey(publicKey);
         signatureBytes = parseSignature(signature);
       } catch (error) {
-        return res.status(400).json({
-          ok: false,
-          error: error.message,
-        });
+        return sendError(
+          res,
+          400,
+          error.message
+        );
       }
 
       const message =
@@ -598,40 +593,40 @@ app.post(
       );
 
       if (!verified) {
-        return res.status(403).json({
-          ok: false,
-          error: "Signature verification failed",
-        });
+        return sendError(
+          res,
+          403,
+          "Signature verification failed"
+        );
       }
 
-      const fingerprint = fingerprintPublicKey(
-        parsedKey.der
-      );
+      const fingerprint = crypto
+        .createHash("sha256")
+        .update(parsedKey.der)
+        .digest("hex");
 
       const result = await pool.query(
-        `
-        UPDATE devices
-        SET pending_public_key = $1,
-            pending_key_fingerprint = $2,
-            updated_at = NOW()
-        WHERE id = $3
-          AND status = 'ACTIVE'
-          AND public_key IS NULL
-          AND (
-            pending_public_key IS NULL
-            OR pending_key_fingerprint = $2
-          )
-        RETURNING id
-        `,
+        `UPDATE devices
+         SET pending_public_key = $1,
+             pending_key_fingerprint = $2,
+             updated_at = NOW()
+         WHERE id = $3
+           AND status = 'ACTIVE'
+           AND public_key IS NULL
+           AND (
+             pending_public_key IS NULL
+             OR pending_key_fingerprint = $2
+           )
+         RETURNING id`,
         [publicKey, fingerprint, device.id]
       );
 
       if (!result.rows.length) {
-        return res.status(409).json({
-          ok: false,
-          error:
-            "A different key enrollment is pending",
-        });
+        return sendError(
+          res,
+          409,
+          "A different key enrollment is pending"
+        );
       }
 
       res.json({
@@ -646,10 +641,8 @@ app.post(
 );
 
 // ====================================================
-// CHALLENGE-RESPONSE AUTHENTICATION
+// AUTHENTICATION CHALLENGE
 // ====================================================
-
-// STEP 1: Generate a one-time challenge.
 
 app.post(
   "/devices/auth/challenge",
@@ -658,33 +651,35 @@ app.post(
       const token = req.get("x-device-token");
 
       if (!validToken(token)) {
-        return res.status(401).json({
-          ok: false,
-          error: "Device token required",
-        });
+        return sendError(
+          res,
+          401,
+          "Device token required"
+        );
       }
 
       const device = await findDeviceByToken(token);
 
       if (!device) {
-        return res.status(401).json({
-          ok: false,
-          error: "Unknown device",
-        });
+        return sendError(
+          res,
+          401,
+          "Unknown device"
+        );
       }
 
       if (
         device.status !== "ACTIVE" ||
         !device.public_key
       ) {
-        return res.status(403).json({
-          ok: false,
-          error: "Approved device key required",
-        });
+        return sendError(
+          res,
+          403,
+          "Approved device key required"
+        );
       }
 
       const challengeId = crypto.randomUUID();
-
       const nonce = crypto
         .randomBytes(32)
         .toString("base64");
@@ -694,15 +689,10 @@ app.post(
       );
 
       await pool.query(
-        `
-        INSERT INTO device_auth_challenges (
-          id,
-          device_id,
-          nonce_hash,
-          expires_at
-        )
-        VALUES ($1, $2, $3, $4)
-        `,
+        `INSERT INTO device_auth_challenges (
+           id, device_id, nonce_hash, expires_at
+         )
+         VALUES ($1,$2,$3,$4)`,
         [
           challengeId,
           device.id,
@@ -724,20 +714,9 @@ app.post(
   }
 );
 
-// STEP 2: Verify the signed challenge.
-//
-// Android must sign exactly:
-//
-// SWIFT_POS_AUTH_V1
-// <deviceId>
-// <challengeId>
-// <nonce>
-//
-// Lines are separated by "\n".
-// There is no trailing newline.
-//
-// Signature algorithm: SHA256withECDSA.
-// Signature encoding: Base64 DER.
+// ====================================================
+// VERIFY CHALLENGE AND CREATE SESSION
+// ====================================================
 
 app.post(
   "/devices/auth/verify",
@@ -757,45 +736,41 @@ app.post(
       typeof nonce !== "string" ||
       nonce.length > 128
     ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid authentication request",
-      });
+      return sendError(
+        res,
+        400,
+        "Invalid authentication request"
+      );
     }
 
     let signatureBytes;
 
     try {
       signatureBytes = parseSignature(signature);
-    } catch (error) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid signature",
-      });
+    } catch (_) {
+      return sendError(
+        res,
+        400,
+        "Invalid signature"
+      );
     }
 
     let client;
 
     try {
       client = await pool.connect();
-
       await client.query("BEGIN");
 
-      // Lock the challenge row so concurrent requests
-      // cannot consume it more than once.
       const result = await client.query(
-        `
-        SELECT
-          c.*,
-          d.status,
-          d.public_key,
-          d.device_token_hash
-        FROM device_auth_challenges c
-        JOIN devices d
-          ON d.id = c.device_id
-        WHERE c.id = $1
-        FOR UPDATE OF c
-        `,
+        `SELECT
+           c.*,
+           d.status,
+           d.public_key,
+           d.device_token_hash
+         FROM device_auth_challenges c
+         JOIN devices d ON d.id = c.device_id
+         WHERE c.id = $1
+         FOR UPDATE OF c`,
         [challengeId]
       );
 
@@ -804,9 +779,8 @@ app.post(
       if (
         !challenge ||
         challenge.consumed_at ||
-        new Date(
-          challenge.expires_at
-        ).getTime() <= Date.now() ||
+        new Date(challenge.expires_at).getTime() <=
+          Date.now() ||
         challenge.status !== "ACTIVE" ||
         !challenge.public_key ||
         !safeEqual(
@@ -816,10 +790,11 @@ app.post(
       ) {
         await client.query("ROLLBACK");
 
-        return res.status(401).json({
-          ok: false,
-          error: "Challenge invalid or expired",
-        });
+        return sendError(
+          res,
+          401,
+          "Challenge invalid or expired"
+        );
       }
 
       if (
@@ -830,10 +805,11 @@ app.post(
       ) {
         await client.query("ROLLBACK");
 
-        return res.status(401).json({
-          ok: false,
-          error: "Challenge mismatch",
-        });
+        return sendError(
+          res,
+          401,
+          "Challenge mismatch"
+        );
       }
 
       const message =
@@ -856,23 +832,20 @@ app.post(
       if (!verified) {
         await client.query("ROLLBACK");
 
-        return res.status(401).json({
-          ok: false,
-          error: "Signature verification failed",
-        });
+        return sendError(
+          res,
+          401,
+          "Signature verification failed"
+        );
       }
 
-      // Consume the challenge.
       await client.query(
-        `
-        UPDATE device_auth_challenges
-        SET consumed_at = NOW()
-        WHERE id = $1
-        `,
+        `UPDATE device_auth_challenges
+         SET consumed_at = NOW()
+         WHERE id = $1`,
         [challengeId]
       );
 
-      // Create a short-lived authenticated session.
       const sessionToken = crypto
         .randomBytes(32)
         .toString("hex");
@@ -882,14 +855,10 @@ app.post(
       );
 
       await client.query(
-        `
-        INSERT INTO device_auth_sessions (
-          token_hash,
-          device_id,
-          expires_at
-        )
-        VALUES ($1, $2, $3)
-        `,
+        `INSERT INTO device_auth_sessions (
+           token_hash, device_id, expires_at
+         )
+         VALUES ($1,$2,$3)`,
         [
           hashToken(sessionToken),
           challenge.device_id,
@@ -911,18 +880,15 @@ app.post(
           await client.query("ROLLBACK");
         } catch (_) {}
       }
-
       next(error);
     } finally {
-      if (client) {
-        client.release();
-      }
+      client?.release();
     }
   }
 );
 
 // ====================================================
-// ADMIN: LIST DEVICES
+// ADMIN DEVICE MANAGEMENT
 // ====================================================
 
 app.get(
@@ -932,15 +898,10 @@ app.get(
     try {
       const result = await pool.query(`
         SELECT
-          id,
-          manufacturer,
-          model,
-          serial_last4,
-          status,
-          public_key_fingerprint,
+          id, manufacturer, model, serial_last4,
+          status, public_key_fingerprint,
           pending_key_fingerprint,
-          created_at,
-          updated_at
+          created_at, updated_at
         FROM devices
         ORDER BY created_at DESC
       `);
@@ -955,32 +916,27 @@ app.get(
   }
 );
 
-// ====================================================
-// ADMIN: APPROVE DEVICE
-// ====================================================
-
 app.post(
   "/admin/devices/:id/approve",
   requireAdmin,
   async (req, res, next) => {
     try {
       const result = await pool.query(
-        `
-        UPDATE devices
-        SET status = 'ACTIVE',
-            updated_at = NOW()
-        WHERE id = $1
-          AND status = 'PENDING'
-        RETURNING *
-        `,
+        `UPDATE devices
+         SET status = 'ACTIVE',
+             updated_at = NOW()
+         WHERE id = $1
+           AND status = 'PENDING'
+         RETURNING *`,
         [req.params.id]
       );
 
       if (!result.rows.length) {
-        return res.status(404).json({
-          ok: false,
-          error: "Pending device not found",
-        });
+        return sendError(
+          res,
+          404,
+          "Pending device not found"
+        );
       }
 
       res.json({
@@ -994,10 +950,6 @@ app.post(
   }
 );
 
-// ====================================================
-// ADMIN: APPROVE PUBLIC KEY
-// ====================================================
-
 app.post(
   "/admin/devices/:id/approve-key",
   requireAdmin,
@@ -1009,37 +961,36 @@ app.post(
         typeof fingerprint !== "string" ||
         !/^[a-f0-9]{64}$/.test(fingerprint)
       ) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "Full lowercase SHA-256 fingerprint required",
-        });
+        return sendError(
+          res,
+          400,
+          "Full lowercase SHA-256 fingerprint required"
+        );
       }
 
       const result = await pool.query(
-        `
-        UPDATE devices
-        SET public_key = pending_public_key,
-            public_key_fingerprint =
-              pending_key_fingerprint,
-            pending_public_key = NULL,
-            pending_key_fingerprint = NULL,
-            updated_at = NOW()
-        WHERE id = $1
-          AND status = 'ACTIVE'
-          AND public_key IS NULL
-          AND pending_public_key IS NOT NULL
-          AND pending_key_fingerprint = $2
-        RETURNING *
-        `,
+        `UPDATE devices
+         SET public_key = pending_public_key,
+             public_key_fingerprint =
+               pending_key_fingerprint,
+             pending_public_key = NULL,
+             pending_key_fingerprint = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND status = 'ACTIVE'
+           AND public_key IS NULL
+           AND pending_public_key IS NOT NULL
+           AND pending_key_fingerprint = $2
+         RETURNING *`,
         [req.params.id, fingerprint]
       );
 
       if (!result.rows.length) {
-        return res.status(409).json({
-          ok: false,
-          error: "No matching pending key",
-        });
+        return sendError(
+          res,
+          409,
+          "No matching pending key"
+        );
       }
 
       res.json({
@@ -1053,41 +1004,41 @@ app.post(
   }
 );
 
-// ====================================================
-// ADMIN: BLOCK DEVICE
-// ====================================================
-
 app.post(
   "/admin/devices/:id/block",
   requireAdmin,
   async (req, res, next) => {
+    let client;
+
     try {
-      const result = await pool.query(
-        `
-        UPDATE devices
-        SET status = 'BLOCKED',
-            updated_at = NOW()
-        WHERE id = $1
-        RETURNING *
-        `,
+      client = await pool.connect();
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `UPDATE devices
+         SET status = 'BLOCKED',
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
         [req.params.id]
       );
 
       if (!result.rows.length) {
-        return res.status(404).json({
-          ok: false,
-          error: "Device not found",
-        });
+        await client.query("ROLLBACK");
+        return sendError(
+          res,
+          404,
+          "Device not found"
+        );
       }
 
-      // Revoke outstanding authenticated sessions.
-      await pool.query(
-        `
-        DELETE FROM device_auth_sessions
-        WHERE device_id = $1
-        `,
+      await client.query(
+        `DELETE FROM device_auth_sessions
+         WHERE device_id = $1`,
         [req.params.id]
       );
+
+      await client.query("COMMIT");
 
       res.json({
         ok: true,
@@ -1095,15 +1046,17 @@ app.post(
         device: publicDevice(result.rows[0]),
       });
     } catch (error) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+      }
       next(error);
+    } finally {
+      client?.release();
     }
   }
 );
-
-
- // ====================================================
- // ADMIN: REACTIVATE BLOCKED DEVICE
- // ====================================================
 
 app.post(
   "/admin/devices/:id/reactivate",
@@ -1116,10 +1069,11 @@ app.post(
         deviceId
       )
     ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid device ID",
-      });
+      return sendError(
+        res,
+        400,
+        "Invalid device ID"
+      );
     }
 
     let client;
@@ -1129,45 +1083,36 @@ app.post(
       await client.query("BEGIN");
 
       const result = await client.query(
-        `
-        UPDATE devices
-        SET status = 'ACTIVE',
-            updated_at = NOW()
-        WHERE id = $1
-          AND status = 'BLOCKED'
-          AND public_key IS NOT NULL
-          AND public_key_fingerprint IS NOT NULL
-        RETURNING *
-        `,
+        `UPDATE devices
+         SET status = 'ACTIVE',
+             updated_at = NOW()
+         WHERE id = $1
+           AND status = 'BLOCKED'
+           AND public_key IS NOT NULL
+           AND public_key_fingerprint IS NOT NULL
+         RETURNING *`,
         [deviceId]
       );
 
       if (!result.rows.length) {
         await client.query("ROLLBACK");
 
-        return res.status(409).json({
-          ok: false,
-          error:
-            "Device is not blocked or has no approved public key",
-        });
+        return sendError(
+          res,
+          409,
+          "Device is not blocked or has no approved public key"
+        );
       }
 
-      // Remove any old sessions and challenges.
-      // The reactivated device must sign a fresh
-      // challenge before accessing protected APIs.
       await client.query(
-        `
-        DELETE FROM device_auth_sessions
-        WHERE device_id = $1
-        `,
+        `DELETE FROM device_auth_sessions
+         WHERE device_id = $1`,
         [deviceId]
       );
 
       await client.query(
-        `
-        DELETE FROM device_auth_challenges
-        WHERE device_id = $1
-        `,
+        `DELETE FROM device_auth_challenges
+         WHERE device_id = $1`,
         [deviceId]
       );
 
@@ -1185,10 +1130,87 @@ app.post(
           await client.query("ROLLBACK");
         } catch (_) {}
       }
-
       next(error);
     } finally {
       client?.release();
+    }
+  }
+);
+
+// ====================================================
+// ADMIN SIMULATION SETTINGS
+// ====================================================
+
+app.get(
+  "/admin/simulation-settings",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `SELECT mode, decline_next, updated_at
+         FROM simulation_settings
+         WHERE id = 1`
+      );
+
+      res.json({
+        ok: true,
+        settings: result.rows[0],
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/admin/simulation-settings",
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const { mode, declineNext } =
+        req.body || {};
+
+      if (
+        mode !== undefined &&
+        !["APPROVE_ALL", "DECLINE_ALL"].includes(mode)
+      ) {
+        return sendError(
+          res,
+          400,
+          "Invalid outcome mode"
+        );
+      }
+
+      if (
+        declineNext !== undefined &&
+        typeof declineNext !== "boolean"
+      ) {
+        return sendError(
+          res,
+          400,
+          "declineNext must be boolean"
+        );
+      }
+
+      const result = await pool.query(
+        `UPDATE simulation_settings
+         SET mode = COALESCE($1, mode),
+             decline_next = COALESCE($2, decline_next),
+             updated_at = NOW()
+         WHERE id = 1
+         RETURNING mode, decline_next, updated_at`,
+        [
+          mode ?? null,
+          declineNext ?? null,
+        ]
+      );
+
+      res.json({
+        ok: true,
+        settings: result.rows[0],
+      });
+    } catch (error) {
+      next(error);
     }
   }
 );
@@ -1201,131 +1223,178 @@ app.post(
   "/process-payment",
   requireActiveDevice,
   async (req, res, next) => {
+    const {
+      amount,
+      currency,
+      protocol,
+      cardBrand,
+      cardLast4,
+    } = req.body || {};
+
+    const requestId = req.get("x-request-id");
+    const value = Number(amount);
+
+    const normalizedCurrency =
+      typeof currency === "string"
+        ? currency.toUpperCase()
+        : "";
+
+    const normalizedBrand =
+      typeof cardBrand === "string"
+        ? cardBrand.toUpperCase().trim()
+        : "";
+
+    const normalizedLast4 =
+      typeof cardLast4 === "string"
+        ? cardLast4
+        : "";
+
+    if (
+      !requestId ||
+      !/^[a-zA-Z0-9_-]{8,128}$/.test(requestId)
+    ) {
+      return sendError(
+        res,
+        400,
+        "Valid request ID required"
+      );
+    }
+
+    if (
+      !Number.isFinite(value) ||
+      value <= 0 ||
+      value > 1000000 ||
+      !["USD", "EUR"].includes(normalizedCurrency) ||
+      typeof protocol !== "string" ||
+      !protocol ||
+      protocol.length > 100 ||
+      !/^[A-Z0-9 _-]{2,32}$/.test(normalizedBrand) ||
+      !/^\d{4}$/.test(normalizedLast4)
+    ) {
+      return sendError(
+        res,
+        400,
+        "Invalid payment details"
+      );
+    }
+
+    const normalizedAmount = value.toFixed(2);
+    let client;
+
     try {
-      const {
-        amount,
-        currency,
-        protocol,
-        testCardId,
-      } = req.body || {};
+      client = await pool.connect();
+      await client.query("BEGIN");
 
-      const requestId = req.get("x-request-id");
-
-      if (
-        !requestId ||
-        !/^[a-zA-Z0-9_-]{8,128}$/.test(requestId)
-      ) {
-        return res.status(400).json({
-          ok: false,
-          error: "Valid request ID required",
-        });
-      }
-
-      const value = Number(amount);
-
-      if (
-        !Number.isFinite(value) ||
-        value <= 0 ||
-        value > 1000000 ||
-        !["USD", "EUR"].includes(currency) ||
-        !["visa", "mastercard"].includes(testCardId) ||
-        typeof protocol !== "string" ||
-        protocol.length > 100
-      ) {
-        return res.status(400).json({
-          ok: false,
-          error: "Invalid test payment details",
-        });
-      }
-
-      const normalizedAmount = value.toFixed(2);
-
-      // SIMULATION ONLY.
-      const approved = testCardId === "visa";
-
-      const transactionId = crypto.randomUUID();
-
-      const result = await pool.query(
-        `
-        INSERT INTO transactions (
-          id,
-          device_id,
-          request_id,
-          amount,
-          currency,
-          protocol,
-          card_brand,
-          card_last4,
-          status,
-          response_code
-        )
-        VALUES (
-          $1, $2, $3, $4, $5,
-          $6, $7, $8, $9, $10
-        )
-        ON CONFLICT (device_id, request_id)
-        DO NOTHING
-        RETURNING *
-        `,
-        [
-          transactionId,
-          req.device.id,
-          requestId,
-          normalizedAmount,
-          currency,
-          protocol,
-          approved ? "VISA" : "MASTERCARD",
-          approved ? "1111" : "4444",
-          approved ? "APPROVED" : "DECLINED",
-          approved ? "00" : "05",
-        ]
+      // Lock the settings row to serialize decisions.
+      // Retries must not consume declineNext twice.
+      const policyResult = await client.query(
+        `SELECT mode, decline_next
+         FROM simulation_settings
+         WHERE id = 1
+         FOR UPDATE`
       );
 
-      let transaction = result.rows[0];
+      const policy = policyResult.rows[0];
 
-      if (!transaction) {
-        const existing = await pool.query(
-          `
-          SELECT *
-          FROM transactions
-          WHERE device_id = $1
-            AND request_id = $2
-          `,
-          [req.device.id, requestId]
+      if (!policy) {
+        throw new Error(
+          "Simulation policy missing"
         );
+      }
 
-        transaction = existing.rows[0];
+      const existingResult = await client.query(
+        `SELECT *
+         FROM transactions
+         WHERE device_id = $1
+           AND request_id = $2`,
+        [req.device.id, requestId]
+      );
 
-        if (!transaction) {
-          throw new Error(
-            "Could not retrieve existing transaction"
+      let transaction = existingResult.rows[0];
+
+      if (transaction) {
+        const sameRequest =
+          Number(transaction.amount).toFixed(2) ===
+            normalizedAmount &&
+          transaction.currency === normalizedCurrency &&
+          transaction.protocol === protocol &&
+          transaction.card_brand === normalizedBrand &&
+          transaction.card_last4 === normalizedLast4;
+
+        if (!sameRequest) {
+          await client.query("ROLLBACK");
+
+          return sendError(
+            res,
+            409,
+            "Request ID reused with different payment details"
+          );
+        }
+      } else {
+        const approved =
+          !policy.decline_next &&
+          policy.mode === "APPROVE_ALL";
+
+        if (policy.decline_next) {
+          await client.query(
+            `UPDATE simulation_settings
+             SET decline_next = FALSE,
+                 updated_at = NOW()
+             WHERE id = 1`
           );
         }
 
-        if (
-          Number(transaction.amount).toFixed(2) !==
-            normalizedAmount ||
-          transaction.currency !== currency ||
-          transaction.protocol !== protocol ||
-          transaction.card_brand !==
-            (approved ? "VISA" : "MASTERCARD")
-        ) {
-          return res.status(409).json({
-            ok: false,
-            error:
-              "Request ID reused with different payment details",
-          });
-        }
+        const result = await client.query(
+          `INSERT INTO transactions (
+             id,
+             device_id,
+             request_id,
+             amount,
+             currency,
+             protocol,
+             card_brand,
+             card_last4,
+             status,
+             response_code
+           )
+           VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+           )
+           RETURNING *`,
+          [
+            crypto.randomUUID(),
+            req.device.id,
+            requestId,
+            normalizedAmount,
+            normalizedCurrency,
+            protocol,
+            normalizedBrand,
+            normalizedLast4,
+            approved ? "APPROVED" : "DECLINED",
+            approved ? "00" : "05",
+          ]
+        );
+
+        transaction = result.rows[0];
       }
+
+      await client.query("COMMIT");
 
       res.json({
         ok: true,
         transaction: formatTransaction(transaction),
         message:
-          "Simulated response only. No funds transferred.",
+          "Simulated authorization only; no funds transferred.",
       });
     } catch (error) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+      }
       next(error);
+    } finally {
+      client?.release();
     }
   }
 );
@@ -1340,13 +1409,11 @@ app.get(
   async (req, res, next) => {
     try {
       const result = await pool.query(
-        `
-        SELECT *
-        FROM transactions
-        WHERE device_id = $1
-        ORDER BY created_at DESC
-        LIMIT 100
-        `,
+        `SELECT *
+         FROM transactions
+         WHERE device_id = $1
+         ORDER BY created_at DESC
+         LIMIT 100`,
         [req.device.id]
       );
 
@@ -1373,23 +1440,26 @@ app.use((error, req, res, next) => {
     error instanceof SyntaxError &&
     error.status === 400
   ) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid JSON",
-    });
+    return sendError(
+      res,
+      400,
+      "Invalid JSON"
+    );
   }
 
   if (error.code === "22P02") {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid identifier",
-    });
+    return sendError(
+      res,
+      400,
+      "Invalid identifier"
+    );
   }
 
-  res.status(500).json({
-    ok: false,
-    error: "Internal server error",
-  });
+  return sendError(
+    res,
+    500,
+    "Internal server error"
+  );
 });
 
 // ====================================================
