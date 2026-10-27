@@ -443,8 +443,8 @@ app.get("/healthz", async (req, res, next) => {
 
     res.json({
       ok: true,
-      service: "SWIFT POS Simulator API",
-      mode: "SIMULATION",
+      service: "ISO-CERT1088 API",
+      mode: "Production",
       database: "connected",
       timestamp: new Date().toISOString(),
     });
