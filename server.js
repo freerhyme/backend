@@ -15,6 +15,28 @@ app.use(express.json({ limit: "20kb" }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const DEMO_CODE_PEPPER = process.env.DEMO_CODE_PEPPER;
+if (!DEMO_CODE_PEPPER || DEMO_CODE_PEPPER.length < 32) {
+  throw new Error("DEMO_CODE_PEPPER must be at least 32 characters");
+}
+
+const PROTOCOL_DEMO_CODES = Object.freeze({
+  "Online Sale 4 Digit Pin": 4,
+  "Online Purchase 4 Digit Pin": 4,
+  "Online Sale 6 Digit Pin": 6,
+  "Online Purchase 6 Digit Pin": 6,
+  "Online Pin Auth and Confirmation 1:1": 4,
+  "Online Forced Sale 4 Digit Pin": 4,
+  "Online One step completion 6 Digit": 6,
+  "Offline Forced Sale 6 Digit": 6,
+  "Offline 6 Digit": 6,
+  "Online Ticket Only or Phone Order 6 Digit": 6,
+  "Online Pre-Auth and Completion": 6,
+});
+const CODELESS_PROTOCOLS = new Set(["Online Mail Order", "Online Pin Less"]);
+const ALL_PROTOCOLS = new Set([...Object.keys(PROTOCOL_DEMO_CODES), ...CODELESS_PROTOCOLS]);
+const DEMO_GRANT_TTL_SECONDS = 120;
+
 
 const ENFORCE_KEY_AUTH =
   process.env.ENFORCE_KEY_AUTH === "true";
@@ -155,6 +177,34 @@ async function initializeDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Device-specific DEMO codes only. Never use for real cardholder PINs.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_protocol_codes (
+      device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      protocol TEXT NOT NULL,
+      code_salt TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (device_id, protocol)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS demo_code_grants (
+      token_hash TEXT PRIMARY KEY,
+      device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      protocol TEXT NOT NULL,
+      payment_hash TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (device_id, request_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_demo_code_grants_device ON demo_code_grants(device_id)`);
 
   console.log("Database initialized");
   const diagnostic = await pool.query(`
@@ -432,6 +482,138 @@ async function requireActiveDevice(req, res, next) {
     next(error);
   }
 }
+
+// ====================================================
+// DEMO CODE HELPERS AND STRICT KEY-SESSION AUTH
+// ====================================================
+
+function paymentFingerprint(payment) {
+  return hashToken(JSON.stringify([
+    Number(payment.amount).toFixed(2),
+    payment.currency.toUpperCase(),
+    payment.protocol,
+    payment.cardBrand.toUpperCase().trim(),
+    payment.cardLast4,
+  ]));
+}
+
+function validateDemoPayment(payment) {
+  if (!payment || typeof payment !== "object") return false;
+  const { amount, currency, protocol, cardBrand, cardLast4 } = payment;
+  const value = Number(amount);
+  return Number.isFinite(value) && value > 0 && value <= 1000000 &&
+    ["USD", "EUR"].includes(currency) && ALL_PROTOCOLS.has(protocol) &&
+    typeof cardBrand === "string" && /^[A-Za-z0-9 _-]{2,32}$/.test(cardBrand) &&
+    typeof cardLast4 === "string" && /^\d{4}$/.test(cardLast4);
+}
+
+function demoCodeHash(code, salt) {
+  return crypto.scryptSync(`${DEMO_CODE_PEPPER}:${code}`, Buffer.from(salt, "hex"), 32).toString("hex");
+}
+
+async function requireApprovedDeviceSession(req, res, next) {
+  try {
+    const token = req.get("x-device-session");
+    if (!validToken(token)) return sendError(res, 401, "Approved device session required", "KEY_SESSION_REQUIRED");
+    const result = await pool.query(`
+      SELECT d.* FROM device_auth_sessions s
+      JOIN devices d ON d.id = s.device_id
+      WHERE s.token_hash = $1 AND s.expires_at > NOW()
+        AND d.status = 'ACTIVE' AND d.public_key IS NOT NULL
+      LIMIT 1`, [hashToken(token)]);
+    if (!result.rows.length) return sendError(res, 401, "Device session expired or revoked", "SESSION_EXPIRED");
+    req.device = result.rows[0];
+    next();
+  } catch (error) { next(error); }
+}
+
+// All new code endpoints are demo-only. Codes are never returned in API responses.
+app.get('/admin/devices/:id/protocol-codes', requireAdmin, async (req, res, next) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return sendError(res, 400, 'Invalid device ID');
+    const device = await pool.query('SELECT id FROM devices WHERE id = $1', [req.params.id]);
+    if (!device.rows.length) return sendError(res, 404, 'Device not found');
+    const result = await pool.query(`SELECT protocol, updated_at AS "updatedAt", locked_until AS "lockedUntil"
+      FROM device_protocol_codes WHERE device_id = $1 ORDER BY protocol`, [req.params.id]);
+    return res.json({ok:true, deviceId:req.params.id, codes:result.rows});
+  } catch (error) { next(error); }
+});
+
+app.put('/admin/devices/:id/protocol-codes', requireAdmin, async (req, res, next) => {
+  try {
+    const { protocol, code } = req.body || {};
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return sendError(res, 400, 'Invalid device ID');
+    const length = PROTOCOL_DEMO_CODES[protocol];
+    if (!length || typeof code !== 'string' || !new RegExp(`^\\d{${length}}$`).test(code)) {
+      return sendError(res, 400, 'Invalid protocol or demo code length');
+    }
+    const device = await pool.query('SELECT id FROM devices WHERE id = $1', [req.params.id]);
+    if (!device.rows.length) return sendError(res, 404, 'Device not found');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hashed = demoCodeHash(code, salt);
+    await pool.query(`INSERT INTO device_protocol_codes (device_id,protocol,code_salt,code_hash)
+      VALUES ($1,$2,$3,$4) ON CONFLICT (device_id,protocol) DO UPDATE SET
+      code_salt=EXCLUDED.code_salt, code_hash=EXCLUDED.code_hash,
+      failed_attempts=0, locked_until=NULL, updated_at=NOW()`,
+      [req.params.id, protocol, salt, hashed]);
+    await pool.query('DELETE FROM demo_code_grants WHERE device_id=$1 AND protocol=$2', [req.params.id, protocol]);
+    res.json({ok:true, message:'Device demo code configured', deviceId:req.params.id, protocol});
+  } catch (error) { next(error); }
+});
+
+app.post('/protocol-code/verify', requireApprovedDeviceSession, async (req, res, next) => {
+  const { protocol, code, requestId, payment } = req.body || {};
+  const length = PROTOCOL_DEMO_CODES[protocol];
+  if (!length || typeof code !== 'string' || code.length !== length || !/^\d+$/.test(code) ||
+      typeof requestId !== 'string' || !/^[a-zA-Z0-9_-]{8,128}$/.test(requestId) ||
+      !validateDemoPayment(payment) || payment.protocol !== protocol) {
+    return sendError(res, 400, 'Invalid demo verification request');
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const result = await client.query(`SELECT * FROM device_protocol_codes
+      WHERE device_id=$1 AND protocol=$2 FOR UPDATE`, [req.device.id, protocol]);
+    const record = result.rows[0];
+    if (!record) {
+      await client.query('ROLLBACK');
+      return sendError(res, 403, 'Demo code not configured', 'CODE_NOT_CONFIGURED');
+    }
+    if (record.locked_until && new Date(record.locked_until).getTime() > Date.now()) {
+      await client.query('ROLLBACK');
+      return sendError(res, 429, 'Too many attempts; try again later', 'CODE_LOCKED');
+    }
+    const match = safeEqual(demoCodeHash(code, record.code_salt), record.code_hash);
+    if (!match) {
+      const failures = record.failed_attempts + 1;
+      await client.query(`UPDATE device_protocol_codes SET failed_attempts=$3,
+        locked_until=CASE WHEN $3 >= 5 THEN NOW() + INTERVAL '15 minutes' ELSE NULL END
+        WHERE device_id=$1 AND protocol=$2`, [req.device.id, protocol, failures >= 5 ? 5 : failures]);
+      await client.query('COMMIT');
+      return sendError(res, failures >= 5 ? 429 : 403,
+        failures >= 5 ? 'Too many attempts; try again later' : 'Demo code not accepted',
+        failures >= 5 ? 'CODE_LOCKED' : 'CODE_INVALID');
+    }
+    await client.query(`UPDATE device_protocol_codes SET failed_attempts=0, locked_until=NULL
+      WHERE device_id=$1 AND protocol=$2`, [req.device.id, protocol]);
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + DEMO_GRANT_TTL_SECONDS * 1000);
+    const inserted = await client.query(`INSERT INTO demo_code_grants
+      (token_hash,device_id,protocol,payment_hash,request_id,expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (device_id,request_id) DO NOTHING RETURNING token_hash`,
+      [hashToken(token),req.device.id,protocol,paymentFingerprint(payment),requestId,expiresAt]);
+    if (!inserted.rows.length) {
+      await client.query('ROLLBACK');
+      return sendError(res, 409, 'Request ID already used');
+    }
+    await client.query('COMMIT');
+    return res.json({ok:true, verificationToken:token, requestId, expiresAt:expiresAt.toISOString(), simulation:true});
+  } catch (error) {
+    if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+    next(error);
+  } finally { client?.release(); }
+});
 
 // ====================================================
 // HEALTH CHECK
@@ -1284,11 +1466,12 @@ app.post("/admin/simulation-settings", requireAdmin, async (req, res, next) => {
 // PROCESS SIMULATED PAYMENT
 // ====================================================
 
-app.post("/process-payment", requireActiveDevice, async (req, res, next) => {
+app.post("/process-payment", requireApprovedDeviceSession, async (req, res, next) => {
   const {
     amount, currency, protocol, cardBrand, cardLast4,
   } = req.body || {};
   const requestId = req.get("x-request-id");
+  const verificationToken = req.get("x-demo-verification");
   const value = Number(amount);
   const normalizedCurrency = typeof currency === "string" ? currency.toUpperCase() : "";
   const normalizedBrand = typeof cardBrand === "string" ? cardBrand.toUpperCase().trim() : "";
@@ -1300,7 +1483,7 @@ app.post("/process-payment", requireActiveDevice, async (req, res, next) => {
   if (
     !Number.isFinite(value) || value <= 0 || value > 1000000 ||
     !["USD", "EUR"].includes(normalizedCurrency) ||
-    typeof protocol !== "string" || protocol.length === 0 || protocol.length > 100 ||
+    typeof protocol !== "string" || !ALL_PROTOCOLS.has(protocol) ||
     !/^[A-Z0-9 _-]{2,32}$/.test(normalizedBrand) ||
     !/^\d{4}$/.test(normalizedLast4)
   ) {
@@ -1341,6 +1524,22 @@ app.post("/process-payment", requireActiveDevice, async (req, res, next) => {
         });
       }
     } else {
+      if (PROTOCOL_DEMO_CODES[protocol]) {
+        if (!validToken(verificationToken)) {
+          await client.query('ROLLBACK');
+          return sendError(res, 403, 'Demo verification required', 'DEMO_VERIFICATION_REQUIRED');
+        }
+        const consumed = await client.query(`UPDATE demo_code_grants SET consumed_at=NOW()
+          WHERE token_hash=$1 AND device_id=$2 AND protocol=$3 AND request_id=$4
+            AND payment_hash=$5 AND expires_at>NOW() AND consumed_at IS NULL
+          RETURNING token_hash`, [hashToken(verificationToken), req.device.id, protocol,
+            requestId, paymentFingerprint({amount:normalizedAmount,currency:normalizedCurrency,
+              protocol,cardBrand:normalizedBrand,cardLast4:normalizedLast4})]);
+        if (!consumed.rows.length) {
+          await client.query('ROLLBACK');
+          return sendError(res, 403, 'Demo verification invalid or expired', 'DEMO_VERIFICATION_INVALID');
+        }
+      }
       const approved = !policy.decline_next && policy.mode === "APPROVE_ALL";
       if (policy.decline_next) {
         await client.query(
