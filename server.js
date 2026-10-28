@@ -545,7 +545,7 @@ app.put('/admin/devices/:id/protocol-codes', requireAdmin, async (req, res, next
     if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return sendError(res, 400, 'Invalid device ID');
     const length = PROTOCOL_DEMO_CODES[protocol];
     if (!length || typeof code !== 'string' || !new RegExp(`^\\d{${length}}$`).test(code)) {
-      return sendError(res, 400, 'Invalid protocol or demo code length');
+      return sendError(res, 400, 'Invalid protocol or code length');
     }
     const device = await pool.query('SELECT id FROM devices WHERE id = $1', [req.params.id]);
     if (!device.rows.length) return sendError(res, 404, 'Device not found');
@@ -557,7 +557,7 @@ app.put('/admin/devices/:id/protocol-codes', requireAdmin, async (req, res, next
       failed_attempts=0, locked_until=NULL, updated_at=NOW()`,
       [req.params.id, protocol, salt, hashed]);
     await pool.query('DELETE FROM demo_code_grants WHERE device_id=$1 AND protocol=$2', [req.params.id, protocol]);
-    res.json({ok:true, message:'Device demo code configured', deviceId:req.params.id, protocol});
+    res.json({ok:true, message:'Device code configured', deviceId:req.params.id, protocol});
   } catch (error) { next(error); }
 });
 
@@ -567,7 +567,7 @@ app.post('/protocol-code/verify', requireApprovedDeviceSession, async (req, res,
   if (!length || typeof code !== 'string' || code.length !== length || !/^\d+$/.test(code) ||
       typeof requestId !== 'string' || !/^[a-zA-Z0-9_-]{8,128}$/.test(requestId) ||
       !validateDemoPayment(payment) || payment.protocol !== protocol) {
-    return sendError(res, 400, 'Invalid demo verification request');
+    return sendError(res, 400, 'Invalid verification request');
   }
   let client;
   try {
@@ -578,7 +578,7 @@ app.post('/protocol-code/verify', requireApprovedDeviceSession, async (req, res,
     const record = result.rows[0];
     if (!record) {
       await client.query('ROLLBACK');
-      return sendError(res, 403, 'Demo code not configured', 'CODE_NOT_CONFIGURED');
+      return sendError(res, 403, 'Code Incorrect', 'CODE_NOT_CONFIGURED');
     }
     if (record.locked_until && new Date(record.locked_until).getTime() > Date.now()) {
       await client.query('ROLLBACK');
@@ -592,7 +592,7 @@ app.post('/protocol-code/verify', requireApprovedDeviceSession, async (req, res,
         WHERE device_id=$1 AND protocol=$2`, [req.device.id, protocol, failures >= 5 ? 5 : failures]);
       await client.query('COMMIT');
       return sendError(res, failures >= 5 ? 429 : 403,
-        failures >= 5 ? 'Too many attempts; try again later' : 'Demo code not accepted',
+        failures >= 5 ? 'Too many attempts; try again later' : 'Code not accepted',
         failures >= 5 ? 'CODE_LOCKED' : 'CODE_INVALID');
     }
     await client.query(`UPDATE device_protocol_codes SET failed_attempts=0, locked_until=NULL
@@ -1527,7 +1527,7 @@ app.post("/process-payment", requireApprovedDeviceSession, async (req, res, next
       if (PROTOCOL_DEMO_CODES[protocol]) {
         if (!validToken(verificationToken)) {
           await client.query('ROLLBACK');
-          return sendError(res, 403, 'Demo verification required', 'DEMO_VERIFICATION_REQUIRED');
+          return sendError(res, 403, 'Verification required', 'VERIFICATION_REQUIRED');
         }
         const consumed = await client.query(`UPDATE demo_code_grants SET consumed_at=NOW()
           WHERE token_hash=$1 AND device_id=$2 AND protocol=$3 AND request_id=$4
@@ -1537,7 +1537,7 @@ app.post("/process-payment", requireApprovedDeviceSession, async (req, res, next
               protocol,cardBrand:normalizedBrand,cardLast4:normalizedLast4})]);
         if (!consumed.rows.length) {
           await client.query('ROLLBACK');
-          return sendError(res, 403, 'Demo verification invalid or expired', 'DEMO_VERIFICATION_INVALID');
+          return sendError(res, 403, 'Verification invalid or expired', 'VERIFICATION_INVALID');
         }
       }
       const approved = !policy.decline_next && policy.mode === "APPROVE_ALL";
